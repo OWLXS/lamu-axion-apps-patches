@@ -1,0 +1,180 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vigaz <pudimdebacon3@gmail.com>
+Date: Mon, 21 Sep 2026 14:25:45 +0000
+Subject: [PATCH 7/7] kernel manager: wire GPU sliders to the real
+ LIMIT_AXION_USER range limiter
+
+Replaces the single-value OPP lock (fix_target_opp_index) with a genuine
+min/max range: addGpuRangeIfPresent() detects the new axion_gpu_range
+kernel node and takes priority over both the old lock and the decorative
+devfreq min_freq/max_freq pair. Since axion_gpu_range takes one combined
+write ("ceiling floor"), not one value per path, writeGpuRange() looks
+up the sibling control (min when writing max, or vice versa), reads its
+last persisted value, and writes both together.
+
+Change-Id: I0adbe1433872dd2d54d84e3d689c884e09f75655
+---
+ .../server/kernel/AxKernelConfigLoader.java   | 47 +++++++++++++++-
+ .../server/kernel/AxKernelManagerService.java | 56 ++++++++++++++++++-
+ 2 files changed, 101 insertions(+), 2 deletions(-)
+
+diff --git a/ax_km_server/src/com/android/server/kernel/AxKernelConfigLoader.java b/ax_km_server/src/com/android/server/kernel/AxKernelConfigLoader.java
+index ff28a0a..8a9e0d4 100644
+--- a/ax_km_server/src/com/android/server/kernel/AxKernelConfigLoader.java
++++ b/ax_km_server/src/com/android/server/kernel/AxKernelConfigLoader.java
+@@ -131,6 +131,7 @@ final class AxKernelConfigLoader {
+     private static final String DIR_GPUFREQV2 = "/proc/gpufreqv2";
+     private static final String NODE_GPUFREQV2_FIX_INDEX = "fix_target_opp_index";
+     private static final String NODE_GPUFREQV2_WORKING_TABLE = "gpu_working_opp_table";
++    private static final String NODE_GPUFREQV2_AXION_RANGE = "axion_gpu_range";
+     private static final Pattern PATTERN_OPP_TABLE_FREQ = Pattern.compile("freq:\\s*(\\d+)");
+ 
+     private static final int DEFAULT_GOV_INDEX = 0;
+@@ -422,7 +423,8 @@ final class AxKernelConfigLoader {
+     }
+ 
+     private static void findGpuFallback(ArrayList<KernelControlNode> controls, AxKernelMetricsReader.Config metricsConfig) {
+-        boolean hasOppIndexControl = addGpuOppIndexIfPresent(GROUP_GPU, controls);
++        boolean hasRangeControl = addGpuRangeIfPresent(GROUP_GPU, controls);
++        boolean hasOppIndexControl = hasRangeControl || addGpuOppIndexIfPresent(GROUP_GPU, controls);
+ 
+         File kgslDir = new File(DIR_KGSL);
+         if (kgslDir.isDirectory()) {
+@@ -483,6 +485,49 @@ final class AxKernelConfigLoader {
+         }
+     }
+ 
++    /**
++     * gpufreqv2 legacy DVFS (e.g. mt6768) with the AxionOS LIMIT_AXION_USER
++     * gpuppm limiter: the kernel clamps the automatic DVFS decision inside
++     * [ceiling, floor] instead of pinning one frequency, so this supersedes
++     * both the single-value OPP lock and the devfreq min_freq/max_freq pair
++     * (decorative on this chip's non-GPUEB driver -- see
++     * kernellamu-gpu-governor-kernel-manager memory). Same index mirroring
++     * and label convention as addGpuOppIndexIfPresent() below.
++     */
++    private static boolean addGpuRangeIfPresent(String group, List<KernelControlNode> controls) {
++        File rangeFile = new File(DIR_GPUFREQV2, NODE_GPUFREQV2_AXION_RANGE);
++        File tableFile = new File(DIR_GPUFREQV2, NODE_GPUFREQV2_WORKING_TABLE);
++        if (!rangeFile.isFile() || !tableFile.isFile()) {
++            return false;
++        }
++
++        int[] freqsKhz = readOppTableFrequenciesKhz(tableFile.getAbsolutePath());
++        if (freqsKhz.length == 0) {
++            return false;
++        }
++
++        int last = freqsKhz.length - 1;
++        int[] indices = new int[freqsKhz.length];
++        for (int i = 0; i <= last; i++) indices[i] = last - i;
++        String[] labels = AxKernelUtils.formatFrequencyLabels(freqsKhz);
++        String[] writeValues = indexStrings(indices.length);
++
++        // A fresh axion_gpu_range starts disabled (no prior user choice), so
++        // there is nothing meaningful to read back -- default to the full,
++        // unrestricted range (slowest..fastest), same as every other
++        // min/max pair on this screen. indices[] is mirrored (see above),
++        // so position 0 is the fastest raw OPP entry / highest UI value
++        // and the last position is the slowest / lowest UI value.
++        int defMin = indices[indices.length - 1];
++        int defMax = indices[0];
++
++        controls.add(new KernelControlNode(ID_GPU_MIN_FREQ, group, AxKernelControl.TYPE_GPU_MIN_FREQ,
++                rangeFile.getAbsolutePath(), defMin, indices, labels, writeValues));
++        controls.add(new KernelControlNode(ID_GPU_MAX_FREQ, group, AxKernelControl.TYPE_GPU_MAX_FREQ,
++                rangeFile.getAbsolutePath(), defMax, indices, labels, writeValues));
++        return true;
++    }
++
+     /**
+      * gpufreqv2 legacy DVFS (e.g. mt6768): pins an exact OPP index via a
+      * debug proc node, bypassing the devfreq governor layer that's a no-op
+diff --git a/ax_km_server/src/com/android/server/kernel/AxKernelManagerService.java b/ax_km_server/src/com/android/server/kernel/AxKernelManagerService.java
+index bdb5c15..f6e7049 100644
+--- a/ax_km_server/src/com/android/server/kernel/AxKernelManagerService.java
++++ b/ax_km_server/src/com/android/server/kernel/AxKernelManagerService.java
+@@ -19,6 +19,7 @@ import android.content.Context;
+ import android.database.ContentObserver;
+ import android.net.Uri;
+ import android.os.Binder;
++import android.os.FileUtils;
+ import android.os.Handler;
+ import android.os.HandlerThread;
+ import android.os.PowerManagerInternal;
+@@ -50,6 +51,11 @@ public final class AxKernelManagerService {
+     private static final String SETTING_CPU_BIG_FREQS = "ax_cpu_big_freqs";
+     private static final String SETTING_CPU_PRIME_FREQS = "ax_cpu_prime_freqs";
+     private static final String SETTING_GPU_FREQS = "ax_gpu_freqs";
++    // AxionOS GPU range limiter (LIMIT_AXION_USER): both the min and max
++    // controls point at this single node and share one combined write of
++    // "ceiling floor" (see writeGpuRange()), unlike every other control here
++    // which owns its own one-value-per-path sysfs node.
++    private static final String PATH_AXION_GPU_RANGE = "/proc/gpufreqv2/axion_gpu_range";
+     private static final char DELIMITER_SPACE = ' ';
+     private static final int INDEX_SMALL_CLUSTER = 0;
+     private static final int INDEX_BIG_CLUSTER = 1;
+@@ -181,7 +187,11 @@ public final class AxKernelManagerService {
+     }
+ 
+     private void applyControlUpdate(KernelControlNode control, int value, boolean isOverride) {
+-        tryWrite(control, value);
++        if (isGpuRangeControl(control)) {
++            writeGpuRange(control, value);
++        } else {
++            tryWrite(control, value);
++        }
+         synchronized (mLock) {
+             refreshControlsLocked();
+         }
+@@ -263,6 +273,50 @@ public final class AxKernelManagerService {
+         }
+     }
+ 
++    private static boolean isGpuRangeControl(KernelControlNode control) {
++        return control != null && PATH_AXION_GPU_RANGE.equals(control.path);
++    }
++
++    /**
++     * The axion_gpu_range kernel node takes one combined write ("ceiling
++     * floor"), not one value per path like every other control. Look up the
++     * sibling control sharing this same path (the min control when writing
++     * max, or vice versa), read its last persisted value, and write both
++     * together. Both controls share the same index<->OPP mapping, so either
++     * one's toFileValue() converts correctly regardless of which slider
++     * moved.
++     */
++    private void writeGpuRange(KernelControlNode control, int value) {
++        KernelControlNode sibling = findGpuRangeSibling(control);
++        int siblingValue = readPersistedValue(sibling);
++        int maxUiValue = control.type == AxKernelControl.TYPE_GPU_MAX_FREQ ? value : siblingValue;
++        int minUiValue = control.type == AxKernelControl.TYPE_GPU_MIN_FREQ ? value : siblingValue;
++        String ceilingIdx = control.toFileValue(maxUiValue);
++        String floorIdx = control.toFileValue(minUiValue);
++        try {
++            FileUtils.stringToFile(control.path, ceilingIdx + " " + floorIdx);
++        } catch (IOException e) {
++            Slog.w(TAG, "Failed to write GPU range to " + control.path, e);
++        }
++    }
++
++    private KernelControlNode findGpuRangeSibling(KernelControlNode control) {
++        synchronized (mLock) {
++            for (KernelControlNode candidate : mControls.values()) {
++                if (candidate != control && isGpuRangeControl(candidate) && candidate.type != control.type) {
++                    return candidate;
++                }
++            }
++        }
++        return null;
++    }
++
++    private int readPersistedValue(KernelControlNode control) {
++        if (control == null) return 0;
++        int saved = Settings.Secure.getIntForUser(mResolver, control.id, Integer.MIN_VALUE, UserHandle.USER_CURRENT);
++        return saved != Integer.MIN_VALUE ? control.coerce(saved) : control.defaultValue;
++    }
++
+     private KernelControlNode findControl(String id) {
+         synchronized (mLock) {
+             refreshControlsLocked();

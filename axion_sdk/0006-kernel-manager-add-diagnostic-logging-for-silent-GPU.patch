@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vigaz <pudimdebacon3@gmail.com>
+Date: Sun, 20 Sep 2026 17:03:56 +0000
+Subject: [PATCH 6/7] kernel manager: add diagnostic logging for silent GPU
+ lock write failures
+
+The GPU frequency-lock slider writes to Settings.Secure correctly (both
+via the direct client write and via setControlValue) but the sysfs node
+never changes - confirmed live via UI drags + unfiltered logcat + manual
+sysfs writes, with zero exceptions or warnings logged anywhere. The only
+silent-false path in setControlValue() is findControl() returning null,
+but that could not be reproduced or ruled out without instrumentation.
+
+Adds: a log in findControl() when the id is not found (dumps the actual
+available control ids), and logs in addGpuOppIndexIfPresent() for each of
+its two early-return conditions, to pin down whether the control is
+missing from the config load itself or something else swallows the write.
+
+Change-Id: Ic123988e5d46fcc4c14a4b55343f5a573726ccc1
+---
+ .../android/server/kernel/AxKernelConfigLoader.java   | 11 +++++++++--
+ .../android/server/kernel/AxKernelManagerService.java | 11 +++++++++--
+ 2 files changed, 18 insertions(+), 4 deletions(-)
+
+diff --git a/ax_km_server/src/com/android/server/kernel/AxKernelConfigLoader.java b/ax_km_server/src/com/android/server/kernel/AxKernelConfigLoader.java
+index f10734c..ff28a0a 100644
+--- a/ax_km_server/src/com/android/server/kernel/AxKernelConfigLoader.java
++++ b/ax_km_server/src/com/android/server/kernel/AxKernelConfigLoader.java
+@@ -493,10 +493,17 @@ final class AxKernelConfigLoader {
+     private static boolean addGpuOppIndexIfPresent(String group, List<KernelControlNode> controls) {
+         File fixIndexFile = new File(DIR_GPUFREQV2, NODE_GPUFREQV2_FIX_INDEX);
+         File tableFile = new File(DIR_GPUFREQV2, NODE_GPUFREQV2_WORKING_TABLE);
+-        if (!fixIndexFile.isFile() || !tableFile.isFile()) return false;
++        if (!fixIndexFile.isFile() || !tableFile.isFile()) {
++            Slog.w(TAG, "addGpuOppIndexIfPresent: node(s) missing, fixIndexFile.isFile()="
++                    + fixIndexFile.isFile() + " tableFile.isFile()=" + tableFile.isFile());
++            return false;
++        }
+ 
+         int[] freqsKhz = readOppTableFrequenciesKhz(tableFile.getAbsolutePath());
+-        if (freqsKhz.length == 0) return false;
++        if (freqsKhz.length == 0) {
++            Slog.w(TAG, "addGpuOppIndexIfPresent: table parsed to 0 entries from " + tableFile.getAbsolutePath());
++            return false;
++        }
+ 
+         // The OPP table is hardware-ordered highest-frequency-first (raw index
+         // 0 = fastest), but every other slider in this screen puts low values
+diff --git a/ax_km_server/src/com/android/server/kernel/AxKernelManagerService.java b/ax_km_server/src/com/android/server/kernel/AxKernelManagerService.java
+index 5f0264a..bdb5c15 100644
+--- a/ax_km_server/src/com/android/server/kernel/AxKernelManagerService.java
++++ b/ax_km_server/src/com/android/server/kernel/AxKernelManagerService.java
+@@ -108,7 +108,10 @@ public final class AxKernelManagerService {
+     }
+ 
+     public boolean setControlValue(String id, int value) {
+-        if (TextUtils.isEmpty(id)) return false;
++        if (TextUtils.isEmpty(id)) {
++            Slog.e(TAG, "setControlValue failed: id is empty");
++            return false;
++        }
+         long token = Binder.clearCallingIdentity();
+         try {
+             KernelControlNode control = findControl(id);
+@@ -263,7 +266,11 @@ public final class AxKernelManagerService {
+     private KernelControlNode findControl(String id) {
+         synchronized (mLock) {
+             refreshControlsLocked();
+-            return mControls.get(id);
++            KernelControlNode control = mControls.get(id);
++            if (control == null) {
++                Slog.e(TAG, "findControl: no control for id [" + id + "]. Available keys: " + mControls.keySet());
++            }
++            return control;
+         }
+     }
+ 

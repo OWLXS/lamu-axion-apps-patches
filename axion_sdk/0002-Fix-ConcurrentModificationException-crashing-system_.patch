@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vigaz <pudimdebacon3@gmail.com>
+Date: Sat, 19 Sep 2026 20:51:24 +0000
+Subject: [PATCH 2/7] Fix ConcurrentModificationException crashing
+ system_server
+
+Two different locks were guarding the same mutable state (mControls):
+most of this class synchronizes on the explicit mLock object, but
+executeRefreshControls() and fetchControlsList() used method-level
+synchronized instead, which locks on `this` - a different monitor. That
+let two threads race through refreshControlsLocked()'s
+mControls.clear()/put() loop at the same time, corrupting the ArrayMap.
+
+Crashed live on device: changing the GPU governor in Kernel Manager
+(SettingsObserver.onChange -> handleSettingChanged -> applyControlUpdate,
+which does hold mLock) raced against a concurrent getControls() call
+(fetchControlsList, which didn't), producing
+
+  java.util.ConcurrentModificationException
+      at android.util.ArrayMap.put(ArrayMap.java:606)
+      at AxKernelManagerService.refreshControlsLocked(...:198)
+      at AxKernelManagerService.applyControlUpdate(...:174)
+      at AxKernelManagerService.handleSettingChanged(...:154)
+
+and took system_server down with it (a full framework restart, felt as
+a slow "soft reboot"). Pre-existing race, but far more likely to fire
+now that GPU controls actually apply and AxDiagnostics polls this
+service more (both landed earlier today).
+
+Switches both methods to synchronize on mLock like the rest of the
+class already does, so all five entry points touching mControls share
+one consistent lock.
+
+Change-Id: If4dc20ef735cbde37cb2f2e517d5ec972c68f629
+---
+ .../server/kernel/AxKernelManagerService.java      | 14 +++++++++-----
+ 1 file changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/ax_km_server/src/com/android/server/kernel/AxKernelManagerService.java b/ax_km_server/src/com/android/server/kernel/AxKernelManagerService.java
+index 37fd4f4..1188d39 100644
+--- a/ax_km_server/src/com/android/server/kernel/AxKernelManagerService.java
++++ b/ax_km_server/src/com/android/server/kernel/AxKernelManagerService.java
+@@ -185,8 +185,10 @@ public final class AxKernelManagerService {
+         }
+     }
+ 
+-    private synchronized void executeRefreshControls() {
+-        refreshControlsLocked();
++    private void executeRefreshControls() {
++        synchronized (mLock) {
++            refreshControlsLocked();
++        }
+     }
+ 
+     private void refreshControlsLocked() {
+@@ -264,9 +266,11 @@ public final class AxKernelManagerService {
+         }
+     }
+ 
+-    private synchronized ArrayList<KernelControlNode> fetchControlsList() {
+-        refreshControlsLocked();
+-        return new ArrayList<>(mControls.values());
++    private ArrayList<KernelControlNode> fetchControlsList() {
++        synchronized (mLock) {
++            refreshControlsLocked();
++            return new ArrayList<>(mControls.values());
++        }
+     }
+ 
+     private void publishMetadata(ArrayList<KernelControlNode> controls) {

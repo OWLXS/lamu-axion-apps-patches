@@ -1,0 +1,135 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vigaz <pudimdebacon3@gmail.com>
+Date: Sat, 19 Sep 2026 01:28:43 +0000
+Subject: [PATCH 1/7] Add GPU governor as a kernel control type
+
+The kernel manager exposed GPU min/max frequency but had no governor
+control, because no TYPE_GPU_GOVERNOR existed and neither the <gpu> XML
+path nor the sysfs autodiscovery fallback ever looked at the governor
+nodes. GPU devfreq exposes the same governor/available_governors pair
+cpufreq does, so the control is built the same way the CPU one is: the
+value is an index into the available list, with the label strings
+doubling as the values written back to sysfs.
+
+Covers both discovery paths - governorNode/governorAvailablePath
+attributes on <gpu>, and the kgsl (devfreq/governor) and generic devfreq
+(governor) fallbacks.
+
+Verified on a MediaTek MT6768 (Mali-G52) that the devfreq governor is
+genuinely wired to the hardware, by cross-checking the real frequency
+reported by /sys/kernel/ged/hal/current_freqency while switching
+governors: powersave pinned the GPU to its 315MHz minimum and
+performance raised it, while the devfreq cur_freq node is stale and
+lags one read behind, which makes it look inert if trusted alone.
+
+Change-Id: Ia33324e39c19c7df84aece7f7d3609aeaf15b7fd
+---
+ .../internal/kernel/AxKernelControl.java      |  2 ++
+ .../server/kernel/AxKernelConfigLoader.java   | 32 ++++++++++++++++++-
+ 2 files changed, 33 insertions(+), 1 deletion(-)
+
+diff --git a/ax_km_common/src/com/android/internal/kernel/AxKernelControl.java b/ax_km_common/src/com/android/internal/kernel/AxKernelControl.java
+index 5be81e9..0c3b490 100644
+--- a/ax_km_common/src/com/android/internal/kernel/AxKernelControl.java
++++ b/ax_km_common/src/com/android/internal/kernel/AxKernelControl.java
+@@ -31,6 +31,7 @@ public final class AxKernelControl implements Parcelable {
+     public static final int TYPE_GPU_MIN_FREQ = 3;
+     public static final int TYPE_GPU_MAX_FREQ = 4;
+     public static final int TYPE_CPU_GOVERNOR = 5;
++    public static final int TYPE_GPU_GOVERNOR = 6;
+ 
+     @IntDef(prefix = {"TYPE_"}, value = {
+             TYPE_CPU_MIN_FREQ,
+@@ -38,6 +39,7 @@ public final class AxKernelControl implements Parcelable {
+             TYPE_GPU_MIN_FREQ,
+             TYPE_GPU_MAX_FREQ,
+             TYPE_CPU_GOVERNOR,
++            TYPE_GPU_GOVERNOR,
+     })
+     @Retention(RetentionPolicy.SOURCE)
+     public @interface ControlType {}
+diff --git a/ax_km_server/src/com/android/server/kernel/AxKernelConfigLoader.java b/ax_km_server/src/com/android/server/kernel/AxKernelConfigLoader.java
+index 8523cc0..be69473 100644
+--- a/ax_km_server/src/com/android/server/kernel/AxKernelConfigLoader.java
++++ b/ax_km_server/src/com/android/server/kernel/AxKernelConfigLoader.java
+@@ -73,6 +73,10 @@ final class AxKernelConfigLoader {
+     private static final String NODE_KGSL_MIN_GPUCLK = "min_gpuclk";
+     private static final String NODE_KGSL_AVAIL_FREQS = "gpu_available_frequencies";
+     private static final String NODE_KGSL_BUSY = "gpubusy";
++    private static final String NODE_DEVFREQ_GOVERNOR = "devfreq/governor";
++    private static final String NODE_DEVFREQ_AVAIL_GOVERNORS = "devfreq/available_governors";
++    private static final String NODE_GOVERNOR = "governor";
++    private static final String NODE_AVAILABLE_GOVERNORS = "available_governors";
+     private static final String NODE_LOAD = "load";
+     private static final String NODE_CUR_FREQ = "cur_freq";
+     private static final String NODE_MAX_FREQ = "max_freq";
+@@ -115,6 +119,7 @@ final class AxKernelConfigLoader {
+     private static final String ID_POLICY_PREFIX = "policy";
+     private static final String ID_GPU_MIN_FREQ = "axion_gpu_min_freq";
+     private static final String ID_GPU_MAX_FREQ = "axion_gpu_max_freq";
++    private static final String ID_GPU_GOVERNOR = "axion_gpu_governor";
+ 
+     private static final int DEFAULT_GOV_INDEX = 0;
+     private static final int DEFAULT_VALUE_ZERO = 0;
+@@ -162,7 +167,8 @@ final class AxKernelConfigLoader {
+     private static boolean hasGpuControls(List<KernelControlNode> controls) {
+         for (int i = 0; i < controls.size(); i++) {
+             int t = controls.get(i).type;
+-            if (t == AxKernelControl.TYPE_GPU_MIN_FREQ || t == AxKernelControl.TYPE_GPU_MAX_FREQ) return true;
++            if (t == AxKernelControl.TYPE_GPU_MIN_FREQ || t == AxKernelControl.TYPE_GPU_MAX_FREQ
++                    || t == AxKernelControl.TYPE_GPU_GOVERNOR) return true;
+         }
+         return false;
+     }
+@@ -249,6 +255,11 @@ final class AxKernelConfigLoader {
+         String curPath = resolveGpuPath(parser, ATTR_CURRENT_NODE, ATTR_CUR_FREQ_PATH, baseNode, NODE_CUR_FREQ);
+         String busyPath = resolveGpuPath(parser, ATTR_USAGE_NODE, ATTR_BUSY_PATH, baseNode, NODE_LOAD);
+ 
++        String govPath = resolveGpuPath(parser, ATTR_GOVERNOR_NODE, "governorPath", baseNode, NODE_GOVERNOR);
++        String govAvailPath = resolveGpuPath(parser, ATTR_GOVERNOR_AVAIL_PATH, "governorAvailableNode",
++                baseNode, NODE_AVAILABLE_GOVERNORS);
++        addGpuGovernorIfPresent(govPath, govAvailPath, group, controls);
++
+         int[] freqs = resolveGpuFrequencies(parser, baseNode);
+         if (freqs.length > 0 && canUse(minPath) && canUse(maxPath)) {
+             int defMin = AxKernelUtils.readSysfsInt(minPath, freqs[0]);
+@@ -374,6 +385,21 @@ final class AxKernelConfigLoader {
+         return minF == maxF ? new int[] { minF } : new int[] { minF, maxF };
+     }
+ 
++    /**
++     * GPU devfreq exposes the same governor/available_governors pair cpufreq does, so the
++     * control is built exactly like the CPU one: the value is an index into the available
++     * list and the label strings double as the values written back to sysfs.
++     */
++    private static void addGpuGovernorIfPresent(String govPath, String govAvailPath, String group,
++            List<KernelControlNode> controls) {
++        if (!canUse(govPath)) return;
++        String[] govs = AxKernelUtils.readSysfsTokens(govAvailPath);
++        if (govs.length == 0) return;
++        int defGov = stringIndex(govs, AxKernelUtils.readSysfsString(govPath), DEFAULT_GOV_INDEX);
++        controls.add(new KernelControlNode(ID_GPU_GOVERNOR, group, AxKernelControl.TYPE_GPU_GOVERNOR,
++                govPath, defGov, indexedValues(govs.length), govs, govs));
++    }
++
+     private static void addGpuControlsIfPresent(File minFreq, File maxFreq, int[] freqs, List<KernelControlNode> controls) {
+         if (freqs.length == 0 || !minFreq.isFile() || !maxFreq.isFile()) return;
+         int defMin = AxKernelUtils.readSysfsInt(minFreq.getAbsolutePath(), freqs[0]);
+@@ -397,6 +423,8 @@ final class AxKernelConfigLoader {
+ 
+             int[] freqs = AxKernelUtils.readSysfsIntList(availFreq.getAbsolutePath());
+             addGpuControlsIfPresent(minFreq, maxFreq, freqs, controls);
++            addGpuGovernorIfPresent(new File(kgslDir, NODE_DEVFREQ_GOVERNOR).getAbsolutePath(),
++                    new File(kgslDir, NODE_DEVFREQ_AVAIL_GOVERNORS).getAbsolutePath(), GROUP_GPU, controls);
+             metricsConfig.addGpu(new AxKernelMetricsReader.GpuConfig(
+                     curFreq.isFile() ? curFreq.getAbsolutePath() : null,
+                     minFreq.isFile() ? minFreq.getAbsolutePath() : null,
+@@ -421,6 +449,8 @@ final class AxKernelConfigLoader {
+ 
+                         int[] freqs = AxKernelUtils.readSysfsIntList(availFreq.getAbsolutePath());
+                         addGpuControlsIfPresent(minFreq, maxFreq, freqs, controls);
++                        addGpuGovernorIfPresent(new File(file, NODE_GOVERNOR).getAbsolutePath(),
++                                new File(file, NODE_AVAILABLE_GOVERNORS).getAbsolutePath(), GROUP_GPU, controls);
+                         metricsConfig.addGpu(new AxKernelMetricsReader.GpuConfig(
+                                 curFreq.isFile() ? curFreq.getAbsolutePath() : null,
+                                 minFreq.isFile() ? minFreq.getAbsolutePath() : null,

@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vigaz <pudimdebacon3@gmail.com>
+Date: Sun, 20 Sep 2026 14:00:34 +0000
+Subject: [PATCH 4/7] Fix GPU frequency lock never reaching the kernel node
+
+AxKernelManagerService registered each control's Settings.Secure
+ContentObserver exactly once, inside systemReady(). Late-appearing
+vendor procfs nodes (MediaTek gpufreqv2, unlike the early-available
+generic cpufreq policies) are not guaranteed to exist yet at that
+point, so the GPU frequency-lock control silently never got an
+observer: Settings.Secure writes (from the UI, or even a raw
+'settings put') persisted fine, but nothing ever wrote the real
+sysfs/procfs node - confirmed live on device, including bypassing the
+UI entirely with a direct settings put.
+
+CPU controls were unaffected since their nodes are always present by
+systemReady() time. The UI itself masked the bug further: it always
+re-discovers all controls fresh via refreshControlsLocked() whenever
+the Kernel Manager screen opens, so the slider always rendered with
+correct values even though writes silently went nowhere.
+
+Fix: make observer registration idempotent (tracked by Uri, so a
+control can safely be (re)observed on every refresh) and register from
+inside refreshControlsLocked() itself, which already runs on every
+getControls() call - so opening the Kernel Manager screen is now
+enough to pick up late-appearing nodes.
+
+Investigated with a second opinion from Gemini before implementing.
+
+Change-Id: I5e05afbf3c19fa11a8a86b99e9a02f338b97f52c
+---
+ .../server/kernel/AxKernelManagerService.java        | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/ax_km_server/src/com/android/server/kernel/AxKernelManagerService.java b/ax_km_server/src/com/android/server/kernel/AxKernelManagerService.java
+index 1188d39..5f0264a 100644
+--- a/ax_km_server/src/com/android/server/kernel/AxKernelManagerService.java
++++ b/ax_km_server/src/com/android/server/kernel/AxKernelManagerService.java
+@@ -26,6 +26,7 @@ import android.os.UserHandle;
+ import android.provider.Settings;
+ import android.text.TextUtils;
+ import android.util.ArrayMap;
++import android.util.ArraySet;
+ import android.util.Slog;
+ 
+ import com.android.internal.kernel.AxKernelControl;
+@@ -59,6 +60,13 @@ public final class AxKernelManagerService {
+     private final Object mLock = new Object();
+     private final ContentResolver mResolver;
+     private final ArrayMap<String, KernelControlNode> mControls = new ArrayMap<>();
++    // Observers are registered lazily as controls are discovered (see
++    // refreshControlsLocked()), since some vendor sysfs/procfs nodes (e.g.
++    // MediaTek's gpufreqv2) aren't ready yet at systemReady() time. Tracked
++    // here so re-registering on every refresh doesn't double-register the
++    // same Uri (ContentResolver does not dedupe that itself - it would fire
++    // onChange() once per registration).
++    private final ArraySet<Uri> mObservedUris = new ArraySet<>();
+     private final AxKernelMetricsReader mMetricsReader = new AxKernelMetricsReader();
+     private final HandlerThread mHandlerThread;
+     private final Handler mHandler;
+@@ -138,8 +146,9 @@ public final class AxKernelManagerService {
+     private void registerObserverForControl(KernelControlNode control) {
+         if (control == null || TextUtils.isEmpty(control.id)) return;
+         Uri uri = Settings.Secure.getUriFor(control.id);
+-        if (uri == null) return;
++        if (uri == null || mObservedUris.contains(uri)) return;
+         mResolver.registerContentObserver(uri, false, mSettingsObserver, UserHandle.USER_ALL);
++        mObservedUris.add(uri);
+     }
+ 
+     private void handleSettingChanged(Uri uri) {
+@@ -201,6 +210,7 @@ public final class AxKernelManagerService {
+         }
+         mMetricsReader.setConfig(metricsConfig);
+         publishMetadata(controls);
++        registerObserversLocked();
+     }
+ 
+     private void applyPersistedValues() {

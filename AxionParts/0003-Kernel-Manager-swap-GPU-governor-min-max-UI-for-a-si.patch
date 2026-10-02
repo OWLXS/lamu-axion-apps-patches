@@ -1,0 +1,210 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vigaz <pudimdebacon3@gmail.com>
+Date: Sun, 20 Sep 2026 09:06:16 +0000
+Subject: [PATCH 3/4] Kernel Manager: swap GPU governor+min/max UI for a single
+ freq-lock slider
+
+Governor picker removed (no real effect on this chip). Min/max freq
+pair replaced with one slider bound to the new TYPE_GPU_OPP_INDEX
+control, which locks GPU frequency to a specific OPP step instead of
+a range.
+
+Change-Id: Iafc4fa40e8bc98356a3c9013fd85d0317f89b364
+---
+ res/values/strings.xml                        |  2 +-
+ .../ui/components/PerformanceComponents.kt    | 26 ++++++-
+ .../ui/screens/KernelManagerScreen.kt         | 69 ++++++-------------
+ 3 files changed, 46 insertions(+), 51 deletions(-)
+
+diff --git a/res/values/strings.xml b/res/values/strings.xml
+index 3f28287..ced7997 100644
+--- a/res/values/strings.xml
++++ b/res/values/strings.xml
+@@ -417,7 +417,7 @@
+     <string name="gpu">GPU</string>
+     <string name="graphics_performance">Graphics Performance</string>
+     <string name="cpu_governor">CPU governor</string>
+-    <string name="gpu_governor">GPU governor</string>
++    <string name="gpu_frequency_lock">GPU Frequency Lock</string>
+     
+     <!-- Performance Formats -->
+     <string name="mhz_format">%1$d MHz</string>
+diff --git a/src/com/android/axion/axionparts/ui/components/PerformanceComponents.kt b/src/com/android/axion/axionparts/ui/components/PerformanceComponents.kt
+index 91f731e..b69887b 100644
+--- a/src/com/android/axion/axionparts/ui/components/PerformanceComponents.kt
++++ b/src/com/android/axion/axionparts/ui/components/PerformanceComponents.kt
+@@ -46,6 +46,7 @@ fun FrequencySlider(
+     settingKey: String,
+     label: String,
+     availableFrequencies: List<Int>? = null,
++    valueLabels: List<String>? = null,
+     min: Int = 0,
+     max: Int = 0,
+     interval: Int = 100000,
+@@ -70,6 +71,25 @@ fun FrequencySlider(
+         currentValue = sourceValue.coerceFrequencyValue(availableFrequencies, min, max)
+     }
+ 
++    // When availableFrequencies doubles as an opaque value (e.g. an OPP
++    // index rather than a real frequency), valueLabels carries the actual
++    // display text per entry, paired positionally and re-sorted the same
++    // way availableFrequencies is below.
++    val sortedLabels =
++        if (availableFrequencies != null && valueLabels != null
++            && valueLabels.size == availableFrequencies.size) {
++            availableFrequencies.zip(valueLabels).sortedBy { it.first }.map { it.second }
++        } else null
++
++    @Composable
++    fun labelForCurrentValue(fallback: Int): String {
++        if (sortedLabels != null && availableFrequencies != null) {
++            val idx = availableFrequencies.sorted().indexOf(currentValue.toInt())
++            if (idx >= 0) return sortedLabels[idx]
++        }
++        return stringResource(R.string.mhz_format, fallback)
++    }
++
+     Column(modifier = modifier.fillMaxWidth().alpha(if (enabled) 1f else 0.4f)) {
+         Row(
+             modifier = Modifier.fillMaxWidth(),
+@@ -82,7 +102,7 @@ fun FrequencySlider(
+                 color = MaterialTheme.colorScheme.onSurface,
+             )
+             Text(
+-                text = stringResource(R.string.mhz_format, currentValue.roundToInt() / unitDivisor),
++                text = labelForCurrentValue(currentValue.roundToInt() / unitDivisor),
+                 style = MaterialTheme.typography.labelLarge,
+                 color = accentColor,
+             )
+@@ -157,12 +177,12 @@ fun FrequencySlider(
+                 }
+ 
+             Text(
+-                text = stringResource(R.string.mhz_format, minDisplay),
++                text = sortedLabels?.firstOrNull() ?: stringResource(R.string.mhz_format, minDisplay),
+                 style = MaterialTheme.typography.labelSmall,
+                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+             )
+             Text(
+-                text = stringResource(R.string.mhz_format, maxDisplay),
++                text = sortedLabels?.lastOrNull() ?: stringResource(R.string.mhz_format, maxDisplay),
+                 style = MaterialTheme.typography.labelSmall,
+                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+             )
+diff --git a/src/com/android/axion/axionparts/ui/screens/KernelManagerScreen.kt b/src/com/android/axion/axionparts/ui/screens/KernelManagerScreen.kt
+index 35b1c32..a123c9e 100644
+--- a/src/com/android/axion/axionparts/ui/screens/KernelManagerScreen.kt
++++ b/src/com/android/axion/axionparts/ui/screens/KernelManagerScreen.kt
+@@ -162,12 +162,8 @@ private fun KernelManagerContent(modifier: Modifier = Modifier) {
+         }
+     val kernelClusters = kernelControls.toCpuClusters()
+     val clusters = kernelClusters.takeIf { it.isNotEmpty() } ?: settingsClusters
+-    val gpuMinControl =
+-        kernelControls.firstOrNull { it.type == AxKernelControl.TYPE_GPU_MIN_FREQ }
+-    val gpuMaxControl =
+-        kernelControls.firstOrNull { it.type == AxKernelControl.TYPE_GPU_MAX_FREQ }
+-    val gpuGovernorControl =
+-        kernelControls.firstOrNull { it.type == AxKernelControl.TYPE_GPU_GOVERNOR }
++    val gpuOppControl =
++        kernelControls.firstOrNull { it.type == AxKernelControl.TYPE_GPU_OPP_INDEX }
+ 
+     Column(
+         modifier =
+@@ -186,11 +182,9 @@ private fun KernelManagerContent(modifier: Modifier = Modifier) {
+             }
+         }
+ 
+-        if (gpuMinControl != null && gpuMaxControl != null) {
++        if (gpuOppControl != null) {
+             GpuGroup(
+-                minControl = gpuMinControl,
+-                maxControl = gpuMaxControl,
+-                governorControl = gpuGovernorControl,
++                oppControl = gpuOppControl,
+                 kernelManager = kernelManager,
+                 onKernelControlsChanged = refreshKernelControls,
+             )
+@@ -261,6 +255,7 @@ private fun KernelFrequencyPreference(
+     defaultValue: Int,
+     onCommit: ((Int) -> Unit)?,
+     unitDivisor: Int = 1000,
++    valueLabels: List<String>? = null,
+ ) {
+     val secureFlow = rememberSettingsFlow(SettingsType.SECURE)
+     val persistedValue by rememberSettingInt(settingKey, SettingsType.SECURE, defaultValue)
+@@ -276,6 +271,7 @@ private fun KernelFrequencyPreference(
+             settingKey = settingKey,
+             label = label,
+             availableFrequencies = availableFreqs.takeIf { it.isNotEmpty() },
++            valueLabels = valueLabels,
+             min = 0,
+             max = maxFreq,
+             interval = 100000,
+@@ -385,51 +381,30 @@ private fun setKernelControl(
+ 
+ @Composable
+ private fun GpuGroup(
+-    minControl: AxKernelControl,
+-    maxControl: AxKernelControl,
+-    governorControl: AxKernelControl?,
++    oppControl: AxKernelControl,
+     kernelManager: AxKernelManager,
+     onKernelControlsChanged: () -> Unit,
+ ) {
+-    val availableFreqs = minControl.availableValues.toList()
+-    val maxFreq = availableFreqs.maxOrNull() ?: maxControl.defaultValue
+-
+-    // GPU devfreq nodes report raw Hz (min_freq/max_freq/available_frequencies), unlike CPU
+-    // cpufreq's kHz convention, so this group needs its own divisor for MHz display.
+-    val gpuUnitDivisor = 1_000_000
++    // TYPE_GPU_OPP_INDEX: availableValues are OPP indices (0 = highest real
++    // frequency this chip's binning allows, not the theoretical silicon max -
++    // see AxKernelConfigLoader.addGpuOppIndexIfPresent), valueLabels carry
++    // the actual MHz text to display for each index. The devfreq governor
++    // this used to expose is a no-op on this chip's non-GPUEB driver, so
++    // there's no governor picker here anymore - just this single lock slider.
++    val indices = oppControl.availableValues.toList()
++    val labels = oppControl.valueLabels.toList().takeIf { it.size == indices.size }
+     PreferenceGroup(title = stringResource(R.string.gpu)) {
+         item {
+             KernelFrequencyPreference(
+-                settingKey = minControl.id,
+-                label = stringResource(R.string.minimum_frequency),
+-                availableFreqs = availableFreqs,
+-                maxFreq = maxFreq,
+-                defaultValue = minControl.defaultValue,
+-                onCommit = { setKernelControl(kernelManager, minControl, it, onKernelControlsChanged) },
+-                unitDivisor = gpuUnitDivisor,
+-            )
+-        }
+-        item {
+-            KernelFrequencyPreference(
+-                settingKey = maxControl.id,
+-                label = stringResource(R.string.maximum_frequency),
+-                availableFreqs = availableFreqs,
+-                maxFreq = maxFreq,
+-                defaultValue = maxControl.defaultValue,
+-                onCommit = { setKernelControl(kernelManager, maxControl, it, onKernelControlsChanged) },
+-                unitDivisor = gpuUnitDivisor,
++                settingKey = oppControl.id,
++                label = stringResource(R.string.gpu_frequency_lock),
++                availableFreqs = indices,
++                maxFreq = indices.maxOrNull() ?: oppControl.defaultValue,
++                defaultValue = oppControl.defaultValue,
++                onCommit = { setKernelControl(kernelManager, oppControl, it, onKernelControlsChanged) },
++                valueLabels = labels,
+             )
+         }
+-        if (governorControl != null) {
+-            item {
+-                GovernorPreference(
+-                    control = governorControl,
+-                    kernelManager = kernelManager,
+-                    onKernelControlsChanged = onKernelControlsChanged,
+-                    titleRes = R.string.gpu_governor,
+-                )
+-            }
+-        }
+     }
+ }
+ 

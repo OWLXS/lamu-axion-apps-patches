@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vigaz <pudimdebacon3@gmail.com>
+Date: Sun, 20 Sep 2026 14:05:47 +0000
+Subject: [PATCH 5/7] Mirror GPU OPP index so the slider reads low-left,
+ high-right
+
+The gpufreqv2 working OPP table is hardware-ordered fastest-first (raw
+index 0 = highest frequency), which addGpuOppIndexIfPresent() was
+exposing to the UI as-is. Every other slider on this screen (CPU
+min/max) puts the low value on the left and the high value on the
+right, so the GPU lock came out backwards: dragging to what looked
+like "0"/leftmost actually selected the highest frequency (823MHz),
+and dragging all the way right selected the lowest (299MHz). Confirmed
+by the user on device.
+
+Fix: the UI-facing value for each table entry is now the mirror of its
+raw OPP index (last - i instead of i). writeValues stays positionally
+mapped to the real table order, so the value actually written to
+fix_target_opp_index is unchanged - only the slider's left-right
+mapping flips. defaultIndex's fallback conversion updated the same
+way.
+
+Not build-validated yet - out/ was busy with the concurrent full ROM
+build (see other commits from today), will validate + confirm on
+device in the next build.
+
+Change-Id: I1a5aceaeeb704c75a20808c1e410d49edfe81dbe
+---
+ .../server/kernel/AxKernelConfigLoader.java        | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/ax_km_server/src/com/android/server/kernel/AxKernelConfigLoader.java b/ax_km_server/src/com/android/server/kernel/AxKernelConfigLoader.java
+index 9d01228..f10734c 100644
+--- a/ax_km_server/src/com/android/server/kernel/AxKernelConfigLoader.java
++++ b/ax_km_server/src/com/android/server/kernel/AxKernelConfigLoader.java
+@@ -498,13 +498,21 @@ final class AxKernelConfigLoader {
+         int[] freqsKhz = readOppTableFrequenciesKhz(tableFile.getAbsolutePath());
+         if (freqsKhz.length == 0) return false;
+ 
+-        int[] indices = indexedValues(freqsKhz.length);
++        // The OPP table is hardware-ordered highest-frequency-first (raw index
++        // 0 = fastest), but every other slider in this screen puts low values
++        // on the left and high values on the right (see CPU min/max freq).
++        // Keep that convention: the UI-facing value is the mirror of the raw
++        // index, while writeValues stays positionally mapped to the table so
++        // the value actually written is still the real OPP index.
++        int last = freqsKhz.length - 1;
++        int[] indices = new int[freqsKhz.length];
++        for (int i = 0; i <= last; i++) indices[i] = last - i;
+         String[] labels = AxKernelUtils.formatFrequencyLabels(freqsKhz);
+         String[] writeValues = indexStrings(indices.length);
+ 
+         int currentIndex = AxKernelUtils.readSysfsInt(fixIndexFile.getAbsolutePath(), -1);
+-        int defaultIndex = (currentIndex >= 0 && currentIndex < indices.length)
+-                ? currentIndex : indices[indices.length - 1];
++        int defaultIndex = (currentIndex >= 0 && currentIndex <= last)
++                ? last - currentIndex : indices[indices.length - 1];
+ 
+         controls.add(new KernelControlNode(ID_GPU_OPP_INDEX, group, AxKernelControl.TYPE_GPU_OPP_INDEX,
+                 fixIndexFile.getAbsolutePath(), defaultIndex, indices, labels, writeValues));

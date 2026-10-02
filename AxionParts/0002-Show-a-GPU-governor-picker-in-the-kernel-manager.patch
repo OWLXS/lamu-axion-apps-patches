@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vigaz <pudimdebacon3@gmail.com>
+Date: Sat, 19 Sep 2026 01:30:19 +0000
+Subject: [PATCH 2/4] Show a GPU governor picker in the kernel manager
+
+The GPU group only had min/max frequency; with TYPE_GPU_GOVERNOR now
+provided by the kernel manager service, render it with the same
+GovernorPreference the CPU clusters use. The composable only hardcoded
+the CPU title, so it takes a title resource now and keeps the CPU one as
+its default. The picker is skipped when the device exposes no GPU
+governor node.
+
+Change-Id: Ib72a9c17d9ca213d4d7be79caa1406356a75e610
+---
+ res/values/strings.xml                          |  1 +
+ .../ui/screens/KernelManagerScreen.kt           | 17 ++++++++++++++++-
+ 2 files changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/res/values/strings.xml b/res/values/strings.xml
+index 84836f2..3f28287 100644
+--- a/res/values/strings.xml
++++ b/res/values/strings.xml
+@@ -417,6 +417,7 @@
+     <string name="gpu">GPU</string>
+     <string name="graphics_performance">Graphics Performance</string>
+     <string name="cpu_governor">CPU governor</string>
++    <string name="gpu_governor">GPU governor</string>
+     
+     <!-- Performance Formats -->
+     <string name="mhz_format">%1$d MHz</string>
+diff --git a/src/com/android/axion/axionparts/ui/screens/KernelManagerScreen.kt b/src/com/android/axion/axionparts/ui/screens/KernelManagerScreen.kt
+index 3e19d3e..35b1c32 100644
+--- a/src/com/android/axion/axionparts/ui/screens/KernelManagerScreen.kt
++++ b/src/com/android/axion/axionparts/ui/screens/KernelManagerScreen.kt
+@@ -166,6 +166,8 @@ private fun KernelManagerContent(modifier: Modifier = Modifier) {
+         kernelControls.firstOrNull { it.type == AxKernelControl.TYPE_GPU_MIN_FREQ }
+     val gpuMaxControl =
+         kernelControls.firstOrNull { it.type == AxKernelControl.TYPE_GPU_MAX_FREQ }
++    val gpuGovernorControl =
++        kernelControls.firstOrNull { it.type == AxKernelControl.TYPE_GPU_GOVERNOR }
+ 
+     Column(
+         modifier =
+@@ -188,6 +190,7 @@ private fun KernelManagerContent(modifier: Modifier = Modifier) {
+             GpuGroup(
+                 minControl = gpuMinControl,
+                 maxControl = gpuMaxControl,
++                governorControl = gpuGovernorControl,
+                 kernelManager = kernelManager,
+                 onKernelControlsChanged = refreshKernelControls,
+             )
+@@ -384,6 +387,7 @@ private fun setKernelControl(
+ private fun GpuGroup(
+     minControl: AxKernelControl,
+     maxControl: AxKernelControl,
++    governorControl: AxKernelControl?,
+     kernelManager: AxKernelManager,
+     onKernelControlsChanged: () -> Unit,
+ ) {
+@@ -416,6 +420,16 @@ private fun GpuGroup(
+                 unitDivisor = gpuUnitDivisor,
+             )
+         }
++        if (governorControl != null) {
++            item {
++                GovernorPreference(
++                    control = governorControl,
++                    kernelManager = kernelManager,
++                    onKernelControlsChanged = onKernelControlsChanged,
++                    titleRes = R.string.gpu_governor,
++                )
++            }
++        }
+     }
+ }
+ 
+@@ -424,6 +438,7 @@ private fun GovernorPreference(
+     control: AxKernelControl,
+     kernelManager: AxKernelManager,
+     onKernelControlsChanged: () -> Unit,
++    titleRes: Int = R.string.cpu_governor,
+ ) {
+     val values = control.availableValues.toList()
+     val labels = control.valueLabels.toList()
+@@ -435,7 +450,7 @@ private fun GovernorPreference(
+     val currentGov = if (savedGov in values) savedGov else control.defaultValue
+     val currentLabel = labels.getOrNull(values.indexOf(currentGov)) ?: labels.first()
+     ListPreference(
+-        title = stringResource(R.string.cpu_governor),
++        title = stringResource(titleRes),
+         summary = currentLabel,
+         options =
+             values.mapIndexed { index, value ->

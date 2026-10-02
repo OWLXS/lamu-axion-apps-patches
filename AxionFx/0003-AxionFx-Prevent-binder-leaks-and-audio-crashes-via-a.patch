@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Saikrishna1504 <saikrishna26918@gmail.com>
+Date: Tue, 15 Sep 2026 10:08:18 +0000
+Subject: [PATCH 3/4] AxionFx: Prevent binder leaks and audio crashes via
+ adaptive session tracking
+
+Change-Id: I423e188cab37212bf2d77d89bee41b9ce870c7c9
+Signed-off-by: Saikrishna1504 <saikrishna26918@gmail.com>
+---
+ .../axion/axionfx/AxionFxController.kt        |  2 +
+ .../axion/axionfx/service/AxionFxService.kt   | 45 ++++++++++++-------
+ 2 files changed, 30 insertions(+), 17 deletions(-)
+
+diff --git a/app/src/com/android/axion/axionfx/AxionFxController.kt b/app/src/com/android/axion/axionfx/AxionFxController.kt
+index 7643438..5466c69 100644
+--- a/app/src/com/android/axion/axionfx/AxionFxController.kt
++++ b/app/src/com/android/axion/axionfx/AxionFxController.kt
+@@ -33,6 +33,8 @@ object AxionFxController {
+ 
+     fun getSessionId(): Int = sessions.keys.firstOrNull() ?: -1
+ 
++    fun getAttachedSessions(): Set<Int> = sessions.keys.toSet()
++
+     fun attachSession(sessionId: Int): Boolean {
+         if (sessions.containsKey(sessionId)) return true
+         return try {
+diff --git a/app/src/com/android/axion/axionfx/service/AxionFxService.kt b/app/src/com/android/axion/axionfx/service/AxionFxService.kt
+index 8cc0f97..7d16939 100644
+--- a/app/src/com/android/axion/axionfx/service/AxionFxService.kt
++++ b/app/src/com/android/axion/axionfx/service/AxionFxService.kt
+@@ -105,18 +105,27 @@ class AxionFxService : Service() {
+     private val audioPlaybackCallback = object : AudioManager.AudioPlaybackCallback() {
+         override fun onPlaybackConfigChanged(configs: MutableList<AudioPlaybackConfiguration>?) {
+             scheduleRoutingEval()
+-            val isActive = configs?.isNotEmpty() == true
++            val isActive = configs?.any { it.isActive } == true
+             if (isActive != lastPlaybackActive) {
+                 lastPlaybackActive = isActive
+                 onPlaybackActivityChanged(isActive)
+             }
+-            configs?.forEach { config ->
+-                val sessionId = config.sessionId
+-                if (sessionId > 0) {
+-                    val attached = AxionFxController.attachSession(sessionId)
+-                    if (attached) {
+-                        restoreSettings()
+-                    }
++
++            val activeSessions = configs?.mapNotNull { config ->
++                if (config.isActive && config.sessionId > 0) config.sessionId else null
++            }?.toSet() ?: emptySet()
++
++            val currentlyAttached = AxionFxController.getAttachedSessions()
++            currentlyAttached.forEach { sessionId ->
++                if (sessionId !in activeSessions) {
++                    AxionFxController.detachSession(sessionId)
++                }
++            }
++
++            activeSessions.forEach { sessionId ->
++                val attached = AxionFxController.attachSession(sessionId)
++                if (attached) {
++                    restoreSettings()
+                 }
+             }
+         }
+@@ -131,18 +140,20 @@ class AxionFxService : Service() {
+         _autoSwitchEnabled.value = prefs.getBoolean(KEY_AUTO_SWITCH, true)
+         audioManager?.registerAudioDeviceCallback(deviceCallback, routingHandler)
+         audioManager?.registerAudioPlaybackCallback(audioPlaybackCallback, Handler(Looper.getMainLooper()))
+-        lastPlaybackActive = audioManager?.activePlaybackConfigurations?.isNotEmpty() == true
++        
++        val activeConfigs = audioManager?.activePlaybackConfigurations
++        lastPlaybackActive = activeConfigs?.any { it.isActive } == true
+         _mediaPlaying.value = lastPlaybackActive
+         if (lastPlaybackActive) heartbeatMonitor.onPlaybackStarted()
+ 
+-        // Prime any already running sessions on boot
+-        audioManager?.activePlaybackConfigurations?.forEach { config ->
+-            val sessionId = config.sessionId
+-            if (sessionId > 0) {
+-                val attached = AxionFxController.attachSession(sessionId)
+-                if (attached) {
+-                    restoreSettings()
+-                }
++        val activeSessions = activeConfigs?.mapNotNull { config ->
++            if (config.isActive && config.sessionId > 0) config.sessionId else null
++        }?.toSet() ?: emptySet()
++
++        activeSessions.forEach { sessionId ->
++            val attached = AxionFxController.attachSession(sessionId)
++            if (attached) {
++                restoreSettings()
+             }
+         }
+ 

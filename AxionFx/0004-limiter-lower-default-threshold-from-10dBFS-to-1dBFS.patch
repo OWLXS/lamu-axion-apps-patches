@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vigaz <pudimdebacon3@gmail.com>
+Date: Sun, 20 Sep 2026 17:03:28 +0000
+Subject: [PATCH 4/4] limiter: lower default threshold from -10dBFS to -1dBFS
+
+The native engine own hardcoded default (Limiter.h DEFAULT_THRESHOLD_DB)
+is -0.1dB - a true-peak safety net that barely engages. The Kotlin app
+defaults (applied on first boot and on every Reset) overrode that with
+-10dB, an order of magnitude more aggressive: it kicks in on most peaks
+of any normally mastered track, causing constant audible gain reduction.
+Reset never fixed the reported bad audio because it kept reapplying this
+same -10dB value. AxionFxService restoreSettings() had the same -10
+hardcoded as a SharedPreferences fallback, fixed to reference the same
+constant instead of duplicating the literal.
+
+Change-Id: I213d344b19740e8a4a6a00b873b191baea46c2d2
+---
+ app/src/com/android/axion/axionfx/domain/EffectDefaults.kt  | 2 +-
+ app/src/com/android/axion/axionfx/service/AxionFxService.kt | 3 ++-
+ 2 files changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/app/src/com/android/axion/axionfx/domain/EffectDefaults.kt b/app/src/com/android/axion/axionfx/domain/EffectDefaults.kt
+index 66a6052..f909dbe 100644
+--- a/app/src/com/android/axion/axionfx/domain/EffectDefaults.kt
++++ b/app/src/com/android/axion/axionfx/domain/EffectDefaults.kt
+@@ -46,7 +46,7 @@ object EffectDefaults {
+     const val COMPRESSOR_ENABLED = false
+     const val AGC_ENABLED = false
+     const val LIMITER_ENABLED = true
+-    const val LIMITER_THRESHOLD = -10
++    const val LIMITER_THRESHOLD = -1
+ 
+     const val REVERB_ENABLED = false
+     const val REVERB_ROOM = 50
+diff --git a/app/src/com/android/axion/axionfx/service/AxionFxService.kt b/app/src/com/android/axion/axionfx/service/AxionFxService.kt
+index 7d16939..ba10050 100644
+--- a/app/src/com/android/axion/axionfx/service/AxionFxService.kt
++++ b/app/src/com/android/axion/axionfx/service/AxionFxService.kt
+@@ -42,6 +42,7 @@ import com.android.axion.axionfx.AxionFxController
+ import com.android.axion.axionfx.device.DeviceCategory
+ import com.android.axion.axionfx.device.DeviceProfile
+ import com.android.axion.axionfx.device.DeviceProfileManager
++import com.android.axion.axionfx.domain.EffectDefaults
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.SupervisorJob
+@@ -285,7 +286,7 @@ class AxionFxService : Service() {
+         AxionFxController.setWidenerWidth(prefs.getInt(KEY_WIDENER_WIDTH, 100))
+         AxionFxController.setWidenerEnabled(prefs.getBoolean(KEY_WIDENER_ENABLED, false))
+ 
+-        AxionFxController.setParameter(0x501, prefs.getInt("limiter_threshold", -10))
++        AxionFxController.setParameter(0x501, prefs.getInt("limiter_threshold", EffectDefaults.LIMITER_THRESHOLD))
+         AxionFxController.setLimiterEnabled(prefs.getBoolean(KEY_LIMITER_ENABLED, true))
+ 
+         AxionFxController.setReverbRoomSize(prefs.getInt(KEY_REVERB_ROOM, 50))

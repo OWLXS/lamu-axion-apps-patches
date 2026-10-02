@@ -1,0 +1,182 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vigaz <pudimdebacon3@gmail.com>
+Date: Sun, 20 Sep 2026 09:06:16 +0000
+Subject: [PATCH 3/7] Replace GPU governor/min-max control with OPP-index freq
+ lock
+
+devfreq governor and min/max freq are effectively no-ops on this
+gpufreqv2 legacy DVFS chip (GPUEB Off, confirmed by careful A/B
+retesting). Add TYPE_GPU_OPP_INDEX, backed by the /proc/gpufreqv2
+fix_target_opp_index debug node, which pins the real OPP index and
+responds immediately. Falls back to the old kgsl/devfreq discovery
+paths when that node is not present.
+
+See kernellamu-gpu-governor-kernel-manager memory for the
+measurements that led here.
+
+Change-Id: I82a495ee9fea29cbc73c91309dab4bf7f981fee8
+---
+ .../internal/kernel/AxKernelControl.java      |  9 +++
+ .../server/kernel/AxKernelConfigLoader.java   | 80 +++++++++++++++++--
+ 2 files changed, 82 insertions(+), 7 deletions(-)
+
+diff --git a/ax_km_common/src/com/android/internal/kernel/AxKernelControl.java b/ax_km_common/src/com/android/internal/kernel/AxKernelControl.java
+index 0c3b490..93b8590 100644
+--- a/ax_km_common/src/com/android/internal/kernel/AxKernelControl.java
++++ b/ax_km_common/src/com/android/internal/kernel/AxKernelControl.java
+@@ -32,6 +32,14 @@ public final class AxKernelControl implements Parcelable {
+     public static final int TYPE_GPU_MAX_FREQ = 4;
+     public static final int TYPE_CPU_GOVERNOR = 5;
+     public static final int TYPE_GPU_GOVERNOR = 6;
++    /**
++     * Single-value GPU OPP index lock (writes to a gpufreqv2-style
++     * fix_target_opp_index debug node instead of a devfreq governor/range).
++     * The chip's devfreq governor is a no-op on drivers without GPUEB, so
++     * this bypasses that layer entirely; see fix_target_opp_index handling
++     * in AxKernelConfigLoader.
++     */
++    public static final int TYPE_GPU_OPP_INDEX = 7;
+ 
+     @IntDef(prefix = {"TYPE_"}, value = {
+             TYPE_CPU_MIN_FREQ,
+@@ -40,6 +48,7 @@ public final class AxKernelControl implements Parcelable {
+             TYPE_GPU_MAX_FREQ,
+             TYPE_CPU_GOVERNOR,
+             TYPE_GPU_GOVERNOR,
++            TYPE_GPU_OPP_INDEX,
+     })
+     @Retention(RetentionPolicy.SOURCE)
+     public @interface ControlType {}
+diff --git a/ax_km_server/src/com/android/server/kernel/AxKernelConfigLoader.java b/ax_km_server/src/com/android/server/kernel/AxKernelConfigLoader.java
+index be69473..9d01228 100644
+--- a/ax_km_server/src/com/android/server/kernel/AxKernelConfigLoader.java
++++ b/ax_km_server/src/com/android/server/kernel/AxKernelConfigLoader.java
+@@ -35,6 +35,8 @@ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.List;
+ import java.util.Locale;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
+ 
+ final class AxKernelConfigLoader {
+     private static final String TAG = "AxKernelConfigLoader";
+@@ -120,6 +122,16 @@ final class AxKernelConfigLoader {
+     private static final String ID_GPU_MIN_FREQ = "axion_gpu_min_freq";
+     private static final String ID_GPU_MAX_FREQ = "axion_gpu_max_freq";
+     private static final String ID_GPU_GOVERNOR = "axion_gpu_governor";
++    private static final String ID_GPU_OPP_INDEX = "axion_gpu_opp_index";
++
++    // gpufreqv2 (MediaTek legacy DVFS, e.g. mt6768): the devfreq governor is a
++    // no-op without GPUEB, but this debug proc node pins the real OPP index
++    // directly (gpufreq_fix_target_oppidx()) and responds immediately. See
++    // kernellamu-gpu-governor-kernel-manager memory for how this was found.
++    private static final String DIR_GPUFREQV2 = "/proc/gpufreqv2";
++    private static final String NODE_GPUFREQV2_FIX_INDEX = "fix_target_opp_index";
++    private static final String NODE_GPUFREQV2_WORKING_TABLE = "gpu_working_opp_table";
++    private static final Pattern PATTERN_OPP_TABLE_FREQ = Pattern.compile("freq:\\s*(\\d+)");
+ 
+     private static final int DEFAULT_GOV_INDEX = 0;
+     private static final int DEFAULT_VALUE_ZERO = 0;
+@@ -168,7 +180,8 @@ final class AxKernelConfigLoader {
+         for (int i = 0; i < controls.size(); i++) {
+             int t = controls.get(i).type;
+             if (t == AxKernelControl.TYPE_GPU_MIN_FREQ || t == AxKernelControl.TYPE_GPU_MAX_FREQ
+-                    || t == AxKernelControl.TYPE_GPU_GOVERNOR) return true;
++                    || t == AxKernelControl.TYPE_GPU_GOVERNOR
++                    || t == AxKernelControl.TYPE_GPU_OPP_INDEX) return true;
+         }
+         return false;
+     }
+@@ -409,6 +422,8 @@ final class AxKernelConfigLoader {
+     }
+ 
+     private static void findGpuFallback(ArrayList<KernelControlNode> controls, AxKernelMetricsReader.Config metricsConfig) {
++        boolean hasOppIndexControl = addGpuOppIndexIfPresent(GROUP_GPU, controls);
++
+         File kgslDir = new File(DIR_KGSL);
+         if (kgslDir.isDirectory()) {
+             File curFreq = new File(kgslDir, NODE_DEVFREQ_CUR_FREQ);
+@@ -422,9 +437,11 @@ final class AxKernelConfigLoader {
+             File busy = new File(kgslDir, NODE_KGSL_BUSY);
+ 
+             int[] freqs = AxKernelUtils.readSysfsIntList(availFreq.getAbsolutePath());
+-            addGpuControlsIfPresent(minFreq, maxFreq, freqs, controls);
+-            addGpuGovernorIfPresent(new File(kgslDir, NODE_DEVFREQ_GOVERNOR).getAbsolutePath(),
+-                    new File(kgslDir, NODE_DEVFREQ_AVAIL_GOVERNORS).getAbsolutePath(), GROUP_GPU, controls);
++            if (!hasOppIndexControl) {
++                addGpuControlsIfPresent(minFreq, maxFreq, freqs, controls);
++                addGpuGovernorIfPresent(new File(kgslDir, NODE_DEVFREQ_GOVERNOR).getAbsolutePath(),
++                        new File(kgslDir, NODE_DEVFREQ_AVAIL_GOVERNORS).getAbsolutePath(), GROUP_GPU, controls);
++            }
+             metricsConfig.addGpu(new AxKernelMetricsReader.GpuConfig(
+                     curFreq.isFile() ? curFreq.getAbsolutePath() : null,
+                     minFreq.isFile() ? minFreq.getAbsolutePath() : null,
+@@ -448,9 +465,11 @@ final class AxKernelConfigLoader {
+                         File load = new File(file, NODE_LOAD);
+ 
+                         int[] freqs = AxKernelUtils.readSysfsIntList(availFreq.getAbsolutePath());
+-                        addGpuControlsIfPresent(minFreq, maxFreq, freqs, controls);
+-                        addGpuGovernorIfPresent(new File(file, NODE_GOVERNOR).getAbsolutePath(),
+-                                new File(file, NODE_AVAILABLE_GOVERNORS).getAbsolutePath(), GROUP_GPU, controls);
++                        if (!hasOppIndexControl) {
++                            addGpuControlsIfPresent(minFreq, maxFreq, freqs, controls);
++                            addGpuGovernorIfPresent(new File(file, NODE_GOVERNOR).getAbsolutePath(),
++                                    new File(file, NODE_AVAILABLE_GOVERNORS).getAbsolutePath(), GROUP_GPU, controls);
++                        }
+                         metricsConfig.addGpu(new AxKernelMetricsReader.GpuConfig(
+                                 curFreq.isFile() ? curFreq.getAbsolutePath() : null,
+                                 minFreq.isFile() ? minFreq.getAbsolutePath() : null,
+@@ -464,6 +483,53 @@ final class AxKernelConfigLoader {
+         }
+     }
+ 
++    /**
++     * gpufreqv2 legacy DVFS (e.g. mt6768): pins an exact OPP index via a
++     * debug proc node, bypassing the devfreq governor layer that's a no-op
++     * on chips without GPUEB. availableValues are the working table's real
++     * frequencies (kHz) so the UI can show them directly; writeValues are
++     * the matching OPP index strings the node actually expects.
++     */
++    private static boolean addGpuOppIndexIfPresent(String group, List<KernelControlNode> controls) {
++        File fixIndexFile = new File(DIR_GPUFREQV2, NODE_GPUFREQV2_FIX_INDEX);
++        File tableFile = new File(DIR_GPUFREQV2, NODE_GPUFREQV2_WORKING_TABLE);
++        if (!fixIndexFile.isFile() || !tableFile.isFile()) return false;
++
++        int[] freqsKhz = readOppTableFrequenciesKhz(tableFile.getAbsolutePath());
++        if (freqsKhz.length == 0) return false;
++
++        int[] indices = indexedValues(freqsKhz.length);
++        String[] labels = AxKernelUtils.formatFrequencyLabels(freqsKhz);
++        String[] writeValues = indexStrings(indices.length);
++
++        int currentIndex = AxKernelUtils.readSysfsInt(fixIndexFile.getAbsolutePath(), -1);
++        int defaultIndex = (currentIndex >= 0 && currentIndex < indices.length)
++                ? currentIndex : indices[indices.length - 1];
++
++        controls.add(new KernelControlNode(ID_GPU_OPP_INDEX, group, AxKernelControl.TYPE_GPU_OPP_INDEX,
++                fixIndexFile.getAbsolutePath(), defaultIndex, indices, labels, writeValues));
++        return true;
++    }
++
++    private static int[] readOppTableFrequenciesKhz(String path) {
++        String text = AxKernelUtils.readSysfsString(path);
++        if (TextUtils.isEmpty(text)) return new int[0];
++        Matcher matcher = PATTERN_OPP_TABLE_FREQ.matcher(text);
++        ArrayList<Integer> freqs = new ArrayList<>();
++        while (matcher.find()) {
++            freqs.add(Integer.parseInt(matcher.group(1)));
++        }
++        int[] result = new int[freqs.size()];
++        for (int i = 0; i < result.length; i++) result[i] = freqs.get(i);
++        return result;
++    }
++
++    private static String[] indexStrings(int length) {
++        String[] result = new String[length];
++        for (int i = 0; i < length; i++) result[i] = String.valueOf(i);
++        return result;
++    }
++
+     private static int[] readCpuIds(File policyDir, int fallbackId) {
+         File affectedFile = new File(policyDir, NODE_AFFECTED_CPUS);
+         if (!affectedFile.isFile()) affectedFile = new File(policyDir, NODE_RELATED_CPUS);

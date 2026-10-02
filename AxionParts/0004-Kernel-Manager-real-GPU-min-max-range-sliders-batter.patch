@@ -1,0 +1,128 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vigaz <pudimdebacon3@gmail.com>
+Date: Mon, 21 Sep 2026 14:29:18 +0000
+Subject: [PATCH 4/4] Kernel Manager: real GPU min/max range sliders + battery
+ warning
+
+GpuRangeGroup replaces the single freq-lock slider (GpuGroup) when the
+kernel exposes both TYPE_GPU_MIN_FREQ and TYPE_GPU_MAX_FREQ controls
+backed by the new axion_gpu_range limiter. Falls back to the old single
+lock slider if only that is present (older kernel without the range
+limiter). Adds a short battery-use warning below the sliders.
+
+Change-Id: Id0111a94d85de09cc7a599054d0cc8560ec611f2
+---
+ res/values/strings.xml                        |  1 +
+ .../ui/screens/KernelManagerScreen.kt         | 66 ++++++++++++++++++-
+ 2 files changed, 66 insertions(+), 1 deletion(-)
+
+diff --git a/res/values/strings.xml b/res/values/strings.xml
+index ced7997..66d8a4c 100644
+--- a/res/values/strings.xml
++++ b/res/values/strings.xml
+@@ -418,6 +418,7 @@
+     <string name="graphics_performance">Graphics Performance</string>
+     <string name="cpu_governor">CPU governor</string>
+     <string name="gpu_frequency_lock">GPU Frequency Lock</string>
++    <string name="gpu_range_warning">Keeping a high minimum can noticeably increase battery use.</string>
+     
+     <!-- Performance Formats -->
+     <string name="mhz_format">%1$d MHz</string>
+diff --git a/src/com/android/axion/axionparts/ui/screens/KernelManagerScreen.kt b/src/com/android/axion/axionparts/ui/screens/KernelManagerScreen.kt
+index a123c9e..6ade106 100644
+--- a/src/com/android/axion/axionparts/ui/screens/KernelManagerScreen.kt
++++ b/src/com/android/axion/axionparts/ui/screens/KernelManagerScreen.kt
+@@ -31,6 +31,7 @@ import androidx.compose.foundation.layout.windowInsetsPadding
+ import androidx.compose.foundation.rememberScrollState
+ import androidx.compose.foundation.verticalScroll
+ import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.getValue
+@@ -164,6 +165,10 @@ private fun KernelManagerContent(modifier: Modifier = Modifier) {
+     val clusters = kernelClusters.takeIf { it.isNotEmpty() } ?: settingsClusters
+     val gpuOppControl =
+         kernelControls.firstOrNull { it.type == AxKernelControl.TYPE_GPU_OPP_INDEX }
++    val gpuMinControl =
++        kernelControls.firstOrNull { it.type == AxKernelControl.TYPE_GPU_MIN_FREQ }
++    val gpuMaxControl =
++        kernelControls.firstOrNull { it.type == AxKernelControl.TYPE_GPU_MAX_FREQ }
+ 
+     Column(
+         modifier =
+@@ -182,7 +187,15 @@ private fun KernelManagerContent(modifier: Modifier = Modifier) {
+             }
+         }
+ 
+-        if (gpuOppControl != null) {
++        if (gpuMinControl != null && gpuMaxControl != null) {
++            GpuRangeGroup(
++                minControl = gpuMinControl,
++                maxControl = gpuMaxControl,
++                kernelManager = kernelManager,
++                onKernelControlsChanged = refreshKernelControls,
++            )
++            Spacer(modifier = Modifier.height(16.dp))
++        } else if (gpuOppControl != null) {
+             GpuGroup(
+                 oppControl = gpuOppControl,
+                 kernelManager = kernelManager,
+@@ -379,6 +392,57 @@ private fun setKernelControl(
+     }
+ }
+ 
++@Composable
++private fun GpuRangeGroup(
++    minControl: AxKernelControl,
++    maxControl: AxKernelControl,
++    kernelManager: AxKernelManager,
++    onKernelControlsChanged: () -> Unit,
++) {
++    // TYPE_GPU_MIN_FREQ/MAX_FREQ here are backed by the AxionOS gpuppm range
++    // limiter (LIMIT_AXION_USER), not the old devfreq min_freq/max_freq pair
++    // (decorative on this chip's non-GPUEB driver) or the single-value lock
++    // this replaces: the kernel clamps the automatic DVFS decision inside
++    // [min, max] instead of pinning one frequency, so the GPU still idles
++    // down normally. availableValues/valueLabels use the same OPP-index-
++    // mirrored convention as the single lock this replaces (see
++    // AxKernelConfigLoader.addGpuRangeIfPresent).
++    val indices = minControl.availableValues.toList()
++    val labels = minControl.valueLabels.toList().takeIf { it.size == indices.size }
++    PreferenceGroup(title = stringResource(R.string.gpu)) {
++        item {
++            KernelFrequencyPreference(
++                settingKey = minControl.id,
++                label = stringResource(R.string.minimum_frequency),
++                availableFreqs = indices,
++                maxFreq = indices.maxOrNull() ?: minControl.defaultValue,
++                defaultValue = minControl.defaultValue,
++                onCommit = { setKernelControl(kernelManager, minControl, it, onKernelControlsChanged) },
++                valueLabels = labels,
++            )
++        }
++        item {
++            KernelFrequencyPreference(
++                settingKey = maxControl.id,
++                label = stringResource(R.string.maximum_frequency),
++                availableFreqs = indices,
++                maxFreq = indices.maxOrNull() ?: maxControl.defaultValue,
++                defaultValue = maxControl.defaultValue,
++                onCommit = { setKernelControl(kernelManager, maxControl, it, onKernelControlsChanged) },
++                valueLabels = labels,
++            )
++        }
++        item {
++            Text(
++                text = stringResource(R.string.gpu_range_warning),
++                style = MaterialTheme.typography.bodySmall,
++                color = MaterialTheme.colorScheme.onSurfaceVariant,
++                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
++            )
++        }
++    }
++}
++
+ @Composable
+ private fun GpuGroup(
+     oppControl: AxKernelControl,

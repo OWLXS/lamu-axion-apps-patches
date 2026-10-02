@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Saikrishna1504 <saikrishna26918@gmail.com>
+Date: Mon, 14 Sep 2026 06:19:58 +0000
+Subject: [PATCH 1/4] AxionFx: Switch from global Session 0 to dynamic audio
+ session attachments Fixes:
+ https://github.com/AxionAOSP/issue_tracker/issues/375
+
+Change-Id: If8ae27e38375877b65e8dad61b2f8eb01f9e8c7b
+Signed-off-by: Saikrishna1504 <saikrishna26918@gmail.com>
+---
+ .../axion/axionfx/service/AxionFxService.kt   | 55 ++++++++++++++++++-
+ 1 file changed, 54 insertions(+), 1 deletion(-)
+
+diff --git a/app/src/com/android/axion/axionfx/service/AxionFxService.kt b/app/src/com/android/axion/axionfx/service/AxionFxService.kt
+index f370d6f..8cc0f97 100644
+--- a/app/src/com/android/axion/axionfx/service/AxionFxService.kt
++++ b/app/src/com/android/axion/axionfx/service/AxionFxService.kt
+@@ -28,6 +28,9 @@ import android.media.AudioDeviceCallback
+ import android.media.AudioDeviceInfo
+ import android.media.AudioManager
+ import android.media.AudioPlaybackConfiguration
++import android.media.audiofx.AudioEffect
++import android.content.IntentFilter
++import android.content.BroadcastReceiver
+ import android.os.Handler
+ import android.os.HandlerThread
+ import android.os.IBinder
+@@ -78,6 +81,27 @@ class AxionFxService : Service() {
+         }
+     }
+ 
++    private val audioSessionReceiver = object : BroadcastReceiver() {
++        override fun onReceive(context: Context, intent: Intent) {
++            val action = intent.action ?: return
++            val sessionId = intent.getIntExtra(AudioEffect.EXTRA_AUDIO_SESSION, -1)
++            Log.d(TAG, "audioSessionReceiver onReceive: action=$action, sessionId=$sessionId")
++            if (sessionId <= 0) return
++
++            when (action) {
++                AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION -> {
++                    val attached = AxionFxController.attachSession(sessionId)
++                    if (attached) {
++                        restoreSettings()
++                    }
++                }
++                AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION -> {
++                    AxionFxController.detachSession(sessionId)
++                }
++            }
++        }
++    }
++
+     private val audioPlaybackCallback = object : AudioManager.AudioPlaybackCallback() {
+         override fun onPlaybackConfigChanged(configs: MutableList<AudioPlaybackConfiguration>?) {
+             scheduleRoutingEval()
+@@ -86,6 +110,15 @@ class AxionFxService : Service() {
+                 lastPlaybackActive = isActive
+                 onPlaybackActivityChanged(isActive)
+             }
++            configs?.forEach { config ->
++                val sessionId = config.sessionId
++                if (sessionId > 0) {
++                    val attached = AxionFxController.attachSession(sessionId)
++                    if (attached) {
++                        restoreSettings()
++                    }
++                }
++            }
+         }
+     }
+ 
+@@ -102,6 +135,24 @@ class AxionFxService : Service() {
+         _mediaPlaying.value = lastPlaybackActive
+         if (lastPlaybackActive) heartbeatMonitor.onPlaybackStarted()
+ 
++        // Prime any already running sessions on boot
++        audioManager?.activePlaybackConfigurations?.forEach { config ->
++            val sessionId = config.sessionId
++            if (sessionId > 0) {
++                val attached = AxionFxController.attachSession(sessionId)
++                if (attached) {
++                    restoreSettings()
++                }
++            }
++        }
++
++        // Register dynamic audio session receiver to listen for open/close session actions
++        val filter = IntentFilter().apply {
++            addAction(AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION)
++            addAction(AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION)
++        }
++        registerReceiver(audioSessionReceiver, filter, Context.RECEIVER_EXPORTED)
++
+         serviceScope.launch {
+             combine(_masterEnabled, _chainHealthyFlow) { enabled, healthy -> enabled to healthy }
+             .collect { (enabled, healthy) ->
+@@ -130,7 +181,6 @@ class AxionFxService : Service() {
+                 return START_NOT_STICKY
+             }
+         }
+-        AxionFxController.attachSession(0)
+         restoreSettings()
+         return START_STICKY
+     }
+@@ -139,6 +189,9 @@ class AxionFxService : Service() {
+ 
+     override fun onDestroy() {
+         instance = null
++        try {
++            unregisterReceiver(audioSessionReceiver)
++        } catch (_: Exception) {}
+         audioManager?.unregisterAudioDeviceCallback(deviceCallback)
+         audioManager?.unregisterAudioPlaybackCallback(audioPlaybackCallback)
+         routingHandler.removeCallbacks(evalRunnable)

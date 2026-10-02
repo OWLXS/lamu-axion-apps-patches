@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vigaz <pudimdebacon3@gmail.com>
+Date: Mon, 21 Sep 2026 14:29:43 +0000
+Subject: [PATCH] RecentsState: disable Live Tile on lamu (MT6768 HWC
+ composition cost)
+
+Removes FLAG_LIVE_TILE from the DEFAULT and MODAL_TASK states instead of
+hardcoding the hasLiveTile() getter, so the underlying bitmask stays
+consistent for anything reading it directly (dumps, future bit-level
+comparisons).
+
+MT6768s HWC cannot give a hardware overlay plane to a video layer that
+has to be scaled+positioned live inside a Recents task snapshot at the
+same time other layers are on screen, forcing full-screen GPU (Client)
+composition for as long as the live tile is shown. Measured: Launcher
+framestats went from normal to 75-92% janky frames with a live tile
+showing a playing video. A static TaskSnapshot avoids that composition
+path entirely; swipe-up/shelf gestures are unaffected (Launcher already
+falls back to animating the static snapshot when live tile is off).
+
+Change-Id: I9b3a1c83609d523056691d00bbeee223aaabc69b
+---
+ .../src/com/android/quickstep/fallback/RecentsState.kt    | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/quickstep/src/com/android/quickstep/fallback/RecentsState.kt b/quickstep/src/com/android/quickstep/fallback/RecentsState.kt
+index b5b1dca..fc9e668 100644
+--- a/quickstep/src/com/android/quickstep/fallback/RecentsState.kt
++++ b/quickstep/src/com/android/quickstep/fallback/RecentsState.kt
+@@ -282,7 +282,12 @@ open class RecentsState(@JvmField val ordinal: Int, private val mFlags: Int) :
+                     FLAG_OVERVIEW_ACTIONS or
+                     FLAG_SHOW_AS_GRID or
+                     FLAG_SCRIM or
+-                    FLAG_LIVE_TILE or
++                    // AxionOS: no FLAG_LIVE_TILE -- MT6768's HWC forces the video
++                    // layer to GPU (Client) composition when it has to be
++                    // scaled+positioned live inside a task snapshot alongside other
++                    // layers, tanking frame pacing system-wide (measured: Launcher
++                    // framestats 75-92% janky during a live tile with video). A
++                    // static TaskSnapshot avoids that composition path.
+                     FLAG_RECENTS_VIEW_VISIBLE or
+                     FLAG_ADD_DESK_BUTTON or
+                     FLAG_SHOW_EXPLODED_DESKTOP_VIEW),
+@@ -296,7 +301,6 @@ open class RecentsState(@JvmField val ordinal: Int, private val mFlags: Int) :
+                     FLAG_MODAL or
+                     FLAG_SHOW_AS_GRID or
+                     FLAG_SCRIM or
+-                    FLAG_LIVE_TILE or
+                     FLAG_RECENTS_VIEW_VISIBLE or
+                     FLAG_SHOW_EXPLODED_DESKTOP_VIEW),
+             )
